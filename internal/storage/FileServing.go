@@ -32,6 +32,7 @@ import (
 	"github.com/forceu/gokapi/internal/storage/filesystem"
 	"github.com/forceu/gokapi/internal/storage/filesystem/s3filesystem/aws"
 	"github.com/forceu/gokapi/internal/storage/processingstatus"
+	"github.com/forceu/gokapi/internal/webserver/api/mutex/apimutex"
 	"github.com/forceu/gokapi/internal/webserver/downloadstatus"
 	"github.com/forceu/gokapi/internal/webserver/headers"
 	"github.com/forceu/gokapi/internal/webserver/sse"
@@ -618,13 +619,26 @@ func GetFileByHotlink(id string) (models.File, bool) {
 }
 
 // ServeFile subtracts a download allowance and serves the file to the browser
-func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDownload, increaseCounter, forceDecryption bool) {
+// Returns false if the file expired during the request (most likely race condition due to parallel downloads, requires recheckExpiry)
+func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDownload, increaseCounter, forceDecryption, recheckExpiry bool) bool {
+	apimutex.Lock(apimutex.TypeMetaData, file.Id)
+	if recheckExpiry {
+		if !file.UnlimitedDownloads {
+			file.DownloadsRemaining = database.GetDownloadsRemaining(file.Id)
+		}
+		if IsExpiredFile(file, time.Now().Unix()) {
+			apimutex.Unlock(apimutex.TypeMetaData, file.Id)
+			return false
+		}
+	}
 	if increaseCounter {
 		file.DownloadsRemaining = file.DownloadsRemaining - 1
 		file.DownloadCount = file.DownloadCount + 1
 		database.IncreaseDownloadCount(file.Id, !file.UnlimitedDownloads)
 		go sse.PublishDownloadCount(file)
 	}
+	apimutex.Unlock(apimutex.TypeMetaData, file.Id)
+
 	logging.LogDownload(file, r, configuration.Get().SaveIp)
 	go serverstats.AddTraffic(uint64(file.SizeBytes))
 
@@ -638,19 +652,19 @@ func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDo
 		if isBlocking {
 			downloadstatus.SetComplete(statusId)
 		}
-		return
+		return true
 	}
 	fileHandler, _, err := getFileHandler(file, configuration.Get().DataDir)
 	defer fileHandler.Close()
 	if err != nil {
 		fmt.Println(err)
 		_, _ = w.Write([]byte("Error getting file handler"))
-		return
+		return true
 	}
 	if file.Encryption.IsEncrypted && !file.RequiresClientDecryption() {
 		if !encryption.IsCorrectKey(file.Encryption, fileHandler) {
 			_, _ = w.Write([]byte("Internal error - Error decrypting file, source data might be damaged or an incorrect key has been used"))
-			return
+			return true
 		}
 	}
 	statusId := downloadstatus.SetDownload(file)
@@ -660,12 +674,13 @@ func ServeFile(file models.File, w http.ResponseWriter, r *http.Request, forceDo
 		if err != nil {
 			_, _ = w.Write([]byte("Error decrypting file"))
 			fmt.Println(err)
-			return
+			return true
 		}
 	} else {
 		http.ServeContent(w, r, file.Name, time.Now(), fileHandler)
 	}
 	downloadstatus.SetComplete(statusId)
+	return true
 }
 
 // Returns the filename if unique or a new filename in the format "Name (x).ext"
